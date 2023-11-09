@@ -1,26 +1,26 @@
-import {CallsConfig, UserState, CallState} from '@calls/common/lib/types';
+import {CallsConfig, CallState, UserSessionState} from '@calls/common/lib/types';
+import {MessageDescriptor} from 'react-intl';
+import {Dispatch, AnyAction} from 'redux';
+import {batchActions} from 'redux-batched-actions';
+
+import {ClientError} from '@mattermost/client';
 import {getChannel as loadChannel} from 'mattermost-redux/actions/channels';
 import {bindClientFunc} from 'mattermost-redux/actions/helpers';
 import {getThread as fetchThread} from 'mattermost-redux/actions/threads';
 import {getProfilesByIds as getProfilesByIdsAction} from 'mattermost-redux/actions/users';
-import {Client4} from 'mattermost-redux/client';
-import {ClientError} from 'mattermost-redux/client/client4';
 import {getChannel} from 'mattermost-redux/selectors/entities/channels';
 import {getConfig} from 'mattermost-redux/selectors/entities/general';
 import {getCurrentTeamId} from 'mattermost-redux/selectors/entities/teams';
 import {getThread} from 'mattermost-redux/selectors/entities/threads';
 import {getCurrentUserId, getUser, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
 import {ActionFunc, DispatchFunc, GenericAction, GetStateFunc} from 'mattermost-redux/types/actions';
-import {MessageDescriptor} from 'react-intl';
-import {Dispatch, AnyAction} from 'redux';
-import {batchActions} from 'redux-batched-actions';
-
 import {CloudFreeTrialModalAdmin, CloudFreeTrialModalUser, IDAdmin, IDUser} from 'src/cloud_pricing/modals';
 import {CallErrorModal, CallErrorModalID} from 'src/components/call_error_modal';
 import {GenericErrorModal, IDGenericErrorModal} from 'src/components/generic_error_modal';
 import {CallsInTestModeModal, IDTestModeUser} from 'src/components/modals';
 import {RING_LENGTH} from 'src/constants';
 import {logErr} from 'src/log';
+import RestClient from 'src/rest_client';
 import {
     channelHasCall, idForCurrentCall, incomingCalls,
     ringingEnabled,
@@ -36,8 +36,8 @@ import {
     isDesktopApp,
     isDMChannel,
     isGMChannel,
-    getProfilesByIds,
     notificationsStopRinging,
+    getProfilesForSessions,
 } from 'src/utils';
 import {modals, notificationSounds, openPricingModal} from 'src/webapp_globals';
 
@@ -54,18 +54,17 @@ import {
     SHOW_SWITCH_CALL_MODAL,
     CALL_REC_PROMPT_DISMISSED,
     CALL_RECORDING_STATE,
-    USER_DISCONNECTED,
     RTCD_ENABLED,
     REMOVE_INCOMING_CALL,
     DID_RING_FOR_CALL,
     RINGING_FOR_CALL,
     DISMISS_CALL,
     CALL_STATE,
-    USERS_CONNECTED,
-    USERS_CONNECTED_STATES,
-    PROFILES_CONNECTED,
+    USERS_STATES,
+    PROFILES_JOINED,
     CALL_HOST,
     USER_SCREEN_ON,
+    USER_LEFT,
 } from './action_types';
 
 export const showExpandedView = () => (dispatch: Dispatch<GenericAction>) => {
@@ -115,7 +114,7 @@ export const hideScreenSourceModal = () => (dispatch: Dispatch<GenericAction>) =
 
 export const getCallsConfig = (): ActionFunc => {
     return bindClientFunc({
-        clientFunc: () => Client4.doFetch<CallsConfig>(
+        clientFunc: () => RestClient.fetch<CallsConfig>(
             `${getPluginPath()}/config`,
             {method: 'get'},
         ),
@@ -138,7 +137,7 @@ export const setRTCDEnabled = (enabled: boolean) => (dispatch: Dispatch<GenericA
 };
 
 export const notifyAdminCloudFreeTrial = async () => {
-    return Client4.doFetch(
+    return RestClient.fetch(
         `${getPluginPath()}/cloud-notify-admins`,
         {method: 'post'},
     );
@@ -178,8 +177,8 @@ export const displayCloudPricing = () => {
 
 export const requestOnPremTrialLicense = async (users: number, termsAccepted: boolean, receiveEmailsAccepted: boolean) => {
     try {
-        const response = await Client4.doFetchWithResponse(
-            `${Client4.getBaseRoute()}/trial-license`,
+        const response = await RestClient.fetch(
+            `${RestClient.getBaseRoute()}/trial-license`,
             {
                 method: 'post',
                 body: JSON.stringify({
@@ -198,7 +197,7 @@ export const requestOnPremTrialLicense = async (users: number, termsAccepted: bo
 };
 
 export const endCall = (channelID: string) => {
-    return Client4.doFetch(
+    return RestClient.fetch(
         `${getPluginPath()}/calls/${channelID}/end`,
         {method: 'post'},
     );
@@ -230,7 +229,7 @@ export const trackEvent = (event: Telemetry.Event, source: Telemetry.Source, pro
             source,
             props,
         };
-        Client4.doFetch(
+        RestClient.fetch(
             `${getPluginPath()}/telemetry/track`,
             {method: 'post', body: JSON.stringify(eventData)},
         ).catch((e) => {
@@ -252,7 +251,7 @@ export function prefetchThread(postId: string) {
 }
 
 export const startCallRecording = (callID: string) => (dispatch: Dispatch<GenericAction>) => {
-    Client4.doFetch(
+    RestClient.fetch(
         `${getPluginPath()}/calls/${callID}/recording/start`,
         {method: 'post'},
     ).catch((err) => {
@@ -273,7 +272,7 @@ export const startCallRecording = (callID: string) => (dispatch: Dispatch<Generi
 };
 
 export const stopCallRecording = async (callID: string) => {
-    return Client4.doFetch(
+    return RestClient.fetch(
         `${getPluginPath()}/calls/${callID}/recording/stop`,
         {method: 'post'},
     );
@@ -364,16 +363,17 @@ export function incomingCallOnChannel(channelID: string, callID: string, callerI
     };
 }
 
-export const userDisconnected = (channelID: string, userID: string) => {
+export const userLeft = (channelID: string, userID: string, sessionID: string) => {
     return async (dispatch: DispatchFunc, getState: GetStateFunc) => {
         // save for later
         const callID = calls(getState())[channelID].ID || '';
 
         await dispatch({
-            type: USER_DISCONNECTED,
+            type: USER_LEFT,
             data: {
                 channelID,
                 userID,
+                session_id: sessionID,
                 currentUserID: getCurrentUserId(getState()),
             },
         });
@@ -386,7 +386,7 @@ export const userDisconnected = (channelID: string, userID: string) => {
 
 export const dismissIncomingCallNotification = (channelID: string, callID: string) => {
     return async (dispatch: DispatchFunc) => {
-        Client4.doFetch(
+        RestClient.fetch(
             `${getPluginPath()}/calls/${channelID}/dismiss-notification`,
             {method: 'post'},
         ).catch((e) => logErr(e));
@@ -465,46 +465,6 @@ export const loadCallState = (channelID: string, call: CallState) => async (disp
         },
     });
 
-    const dismissed = call.dismissed_notification;
-    if (dismissed) {
-        const currentUserID = getCurrentUserId(getState());
-        if (Object.hasOwn(dismissed, currentUserID) && dismissed[currentUserID]) {
-            actions.push({
-                type: DISMISS_CALL,
-                data: {
-                    callID: call.id,
-                },
-            });
-        }
-    }
-
-    actions.push({
-        type: USERS_CONNECTED,
-        data: {
-            users: call.users || [],
-            channelID,
-        },
-    });
-
-    actions.push({
-        type: CALL_HOST,
-        data: {
-            channelID,
-            hostID: call.host_id,
-            hostChangeAt: hostChangeAtForCurrentCall(getState()) || call.start_at,
-        },
-    });
-
-    if (call.users && call.users.length > 0) {
-        actions.push({
-            type: PROFILES_CONNECTED,
-            data: {
-                profiles: await getProfilesByIds(getState(), call.users),
-                channelID,
-            },
-        });
-    }
-
     actions.push({
         type: CALL_RECORDING_STATE,
         data: {
@@ -518,19 +478,51 @@ export const loadCallState = (channelID: string, call: CallState) => async (disp
         data: {
             channelID,
             userID: call.screen_sharing_id,
+            session_id: call.screen_sharing_session_id,
         },
     });
 
-    const userStates: Record<string, UserState> = {};
-    const users = call.users || [];
-    const states = call.states || [];
-    for (let i = 0; i < users.length; i++) {
-        userStates[users[i]] = {...states[i], id: users[i]};
-    }
     actions.push({
-        type: USERS_CONNECTED_STATES,
+        type: CALL_HOST,
         data: {
-            states: userStates,
+            channelID,
+            hostID: call.host_id,
+            hostChangeAt: hostChangeAtForCurrentCall(getState()) || call.start_at,
+        },
+    });
+
+    const dismissed = call.dismissed_notification;
+    if (dismissed) {
+        const currentUserID = getCurrentUserId(getState());
+        if (Object.hasOwn(dismissed, currentUserID) && dismissed[currentUserID]) {
+            actions.push({
+                type: DISMISS_CALL,
+                data: {
+                    callID: call.id,
+                },
+            });
+        }
+    }
+
+    const states: Record<string, UserSessionState> = {};
+    for (let i = 0; i < call.sessions.length; i++) {
+        states[call.sessions[i].session_id] = call.sessions[i];
+    }
+
+    if (call.sessions.length > 0) {
+        actions.push({
+            type: PROFILES_JOINED,
+            data: {
+                profiles: await getProfilesForSessions(getState(), call.sessions),
+                channelID,
+            },
+        });
+    }
+
+    actions.push({
+        type: USERS_STATES,
+        data: {
+            states,
             channelID,
         },
     });

@@ -1,9 +1,9 @@
 
-import {Channel} from '@mattermost/types/channels';
-import {UserProfile} from '@mattermost/types/users';
 import React, {CSSProperties} from 'react';
 import {IntlShape} from 'react-intl';
 
+import {Channel} from '@mattermost/types/channels';
+import {UserProfile} from '@mattermost/types/users';
 import {endCall} from 'src/actions';
 import CompassIcon from 'src/components/icons/compassIcon';
 import {isDMChannel, isGMChannel, getUserDisplayName} from 'src/utils';
@@ -15,7 +15,7 @@ interface Props {
     show: boolean,
     channel: Channel,
     connectedDMUser: UserProfile | undefined,
-    connectedUsers: string[],
+    numParticipants: number,
     hideEndCallModal: () => void,
 }
 
@@ -107,7 +107,7 @@ export default class EndCallModal extends React.PureComponent<Props, State> {
     private endCall = () => {
         endCall(this.props.channel.id).then(() => {
             this.hideModal();
-        }).catch((err) => {
+        }).catch((err: any) => {
             this.setState({
                 errorMsg: err.response && err.response.data ? err.response.data.err : err.toString(),
             });
@@ -150,7 +150,7 @@ export default class EndCallModal extends React.PureComponent<Props, State> {
         } else {
             msg = (<React.Fragment>
                 {formatMessage({defaultMessage: 'Are you sure you want to end a call with {count, plural, =1 {# participant} other {# participants}} in {channelName}?'},
-                    {count: this.props.connectedUsers.length, channelName: this.props.channel.display_name})}
+                    {count: this.props.numParticipants, channelName: this.props.channel.display_name})}
             </React.Fragment>);
         }
 

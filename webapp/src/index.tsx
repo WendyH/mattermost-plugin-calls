@@ -1,14 +1,6 @@
 /* eslint-disable max-lines */
 
 import {CallChannelState} from '@calls/common/lib/types';
-import {getChannel as getChannelAction} from 'mattermost-redux/actions/channels';
-import {getProfilesByIds as getProfilesByIdsAction} from 'mattermost-redux/actions/users';
-import {Client4} from 'mattermost-redux/client';
-import {getChannel, getCurrentChannelId} from 'mattermost-redux/selectors/entities/channels';
-import {getConfig} from 'mattermost-redux/selectors/entities/general';
-import {getCurrentUserLocale} from 'mattermost-redux/selectors/entities/i18n';
-import {getCurrentTeamId} from 'mattermost-redux/selectors/entities/teams';
-import {getCurrentUserId, getUser, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
 import React from 'react';
 import ReactDOM from 'react-dom';
 import {injectIntl, IntlProvider} from 'react-intl';
@@ -16,6 +8,13 @@ import {Provider} from 'react-redux';
 import {AnyAction} from 'redux';
 import {batchActions} from 'redux-batched-actions';
 
+import {getChannel as getChannelAction} from 'mattermost-redux/actions/channels';
+import {getProfilesByIds as getProfilesByIdsAction} from 'mattermost-redux/actions/users';
+import {getChannel, getCurrentChannelId} from 'mattermost-redux/selectors/entities/channels';
+import {getConfig} from 'mattermost-redux/selectors/entities/general';
+import {getCurrentUserLocale} from 'mattermost-redux/selectors/entities/i18n';
+import {getCurrentTeamId} from 'mattermost-redux/selectors/entities/teams';
+import {getCurrentUserId, getUser, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
 import {
     displayCallErrorModal,
     displayCallsTestModeUser,
@@ -45,22 +44,21 @@ import {PostTypeRecording} from 'src/components/custom_post_types/post_type_reco
 import {IncomingCallContainer} from 'src/components/incoming_calls/call_container';
 import {CALL_RECORDING_POST_TYPE, CALL_START_POST_TYPE, DisabledCallsErr} from 'src/constants';
 import {desktopNotificationHandler} from 'src/desktop_notifications';
+import RestClient from 'src/rest_client';
 import slashCommandsHandler from 'src/slash_commands';
 import {CallActions, CurrentCallData, CurrentCallDataDefault} from 'src/types/types';
 
 import {
     DESKTOP_WIDGET_CONNECTED,
     RECEIVED_CHANNEL_STATE,
-    USER_CONNECTED,
-    USERS_CONNECTED,
-    PROFILES_CONNECTED,
+    PROFILES_JOINED,
     CALL_STATE,
     UNINIT,
     SHOW_SWITCH_CALL_MODAL,
     USER_MUTED,
     USER_UNMUTED,
     USER_RAISE_HAND,
-    USER_UNRAISE_HAND,
+    USER_LOWER_HAND,
     DISMISS_CALL,
 } from './action_types';
 import CallsClient from './client';
@@ -80,8 +78,6 @@ import {pluginId} from './manifest';
 import reducer from './reducers';
 import {
     channelIDForCurrentCall,
-    usersInCallInCurrentChannel,
-    usersInCallInChannel,
     isLimitRestricted,
     iceServers,
     needsTURNCredentials,
@@ -94,6 +90,7 @@ import {
     callsExplicitlyEnabled,
     callsExplicitlyDisabled,
     channelHasCall,
+    profilesInCallInChannel,
 } from './selectors';
 import {JOIN_CALL, keyToAction} from './shortcuts';
 import {DesktopNotificationArgs, PluginRegistry, Store} from './types/mattermost-webapp';
@@ -103,11 +100,11 @@ import {
     getChannelURL,
     getExpandedChannelID,
     getPluginPath,
-    getProfilesByIds,
     getTranslations,
+    getProfilesForSessions,
+    isDMChannel,
     getUserIdFromDM,
     getWSConnectionURL,
-    isDMChannel,
     playSound,
     sendDesktopEvent,
     shouldRenderDesktopWidget,
@@ -117,8 +114,6 @@ import {
     handleCallHostChanged,
     handleCallRecordingState,
     handleCallStart,
-    handleUserConnected,
-    handleUserDisconnected,
     handleUserDismissedNotification,
     handleUserMuted,
     handleUserRaisedHand,
@@ -130,6 +125,8 @@ import {
     handleUserScreenOn,
     handleUserScreenOff,
     handleUserUnraisedHand,
+    handleUserJoined,
+    handleUserLeft,
 } from './websocket_handlers';
 
 export default class Plugin {
@@ -159,12 +156,12 @@ export default class Plugin {
             });
         });
 
-        registry.registerWebSocketEventHandler(`custom_${pluginId}_user_connected`, (ev) => {
-            handleUserConnected(store, ev);
+        registry.registerWebSocketEventHandler(`custom_${pluginId}_user_joined`, (ev) => {
+            handleUserJoined(store, ev);
         });
 
-        registry.registerWebSocketEventHandler(`custom_${pluginId}_user_disconnected`, (ev) => {
-            handleUserDisconnected(store, ev);
+        registry.registerWebSocketEventHandler(`custom_${pluginId}_user_left`, (ev) => {
+            handleUserLeft(store, ev);
         });
 
         registry.registerWebSocketEventHandler(`custom_${pluginId}_user_muted`, (ev) => {
@@ -231,7 +228,7 @@ export default class Plugin {
     private initialize(registry: PluginRegistry, store: Store) {
         // Setting the base URL if present, in case MM is running under a subpath.
         if (window.basename) {
-            Client4.setUrl(window.basename);
+            RestClient.setUrl(window.basename);
         }
 
         // Register root DOM element for Calls. This is where the widget will render.
@@ -270,27 +267,12 @@ export default class Plugin {
         });
 
         const connectToCall = async (channelId: string, teamId: string, title?: string, rootId?: string) => {
-            try {
-                const users = usersInCallInCurrentChannel(store.getState());
-                if (users && users.length > 0) {
-                    store.dispatch({
-                        type: PROFILES_CONNECTED,
-                        data: {
-                            profiles: await getProfilesByIds(store.getState(), users),
-                            channelId,
-                        },
-                    });
-                }
-            } catch (err) {
-                logErr(err);
-            }
-
             if (!channelIDForCurrentCall(store.getState())) {
                 connectCall(channelId, title, rootId);
 
                 // following the thread only on join. On call start
                 // this is done in the call_start ws event handler.
-                if (usersInCallInChannel(store.getState(), channelId).length > 0) {
+                if (profilesInCallInChannel(store.getState(), channelId).length > 0) {
                     followThread(store, channelId, teamId);
                 }
             } else if (channelIDForCurrentCall(store.getState()) !== channelId) {
@@ -408,7 +390,7 @@ export default class Plugin {
                 if (needsTURNCredentials(state)) {
                     logDebug('turn credentials needed');
                     try {
-                        iceConfigs.push(...await Client4.doFetch<RTCIceServer[]>(`${getPluginPath()}/turn-credentials`, {method: 'get'}));
+                        iceConfigs.push(...await RestClient.fetch<RTCIceServer[]>(`${getPluginPath()}/turn-credentials`, {method: 'get'}));
                     } catch (err) {
                         logErr(err);
                     }
@@ -475,6 +457,7 @@ export default class Plugin {
                         data: {
                             channelID: window.callsClient?.channelID,
                             userID: getCurrentUserId(store.getState()),
+                            session_id: window.callsClient?.getSessionID(),
                         },
                     });
                 });
@@ -485,6 +468,7 @@ export default class Plugin {
                         data: {
                             channelID: window.callsClient?.channelID,
                             userID: getCurrentUserId(store.getState()),
+                            session_id: window.callsClient?.getSessionID(),
                         },
                     });
                 });
@@ -496,16 +480,18 @@ export default class Plugin {
                             channelID: window.callsClient?.channelID,
                             userID: getCurrentUserId(store.getState()),
                             raised_hand: Date.now(),
+                            session_id: window.callsClient?.getSessionID(),
                         },
                     });
                 });
 
                 window.callsClient.on('lower_hand', () => {
                     store.dispatch({
-                        type: USER_UNRAISE_HAND,
+                        type: USER_LOWER_HAND,
                         data: {
                             channelID: window.callsClient?.channelID,
                             userID: getCurrentUserId(store.getState()),
+                            session_id: window.callsClient?.getSessionID(),
                         },
                     });
                 });
@@ -543,7 +529,10 @@ export default class Plugin {
                 }
                 store.dispatch({
                     type: DESKTOP_WIDGET_CONNECTED,
-                    data: {channelID: ev.data.message.callID},
+                    data: {
+                        channel_id: ev.data.message.callID,
+                        session_id: ev.data.message.sessionID,
+                    },
                 });
             } else if (ev.data?.type === 'calls-join-request') {
                 // we can assume that we are already in a call, since the global widget sent this.
@@ -567,7 +556,7 @@ export default class Plugin {
                 ChannelHeaderMenuButton,
                 async () => {
                     try {
-                        const data = await Client4.doFetch<{ enabled: boolean }>(`${getPluginPath()}/${currChannelId}`, {
+                        const data = await RestClient.fetch<{ enabled: boolean }>(`${getPluginPath()}/${currChannelId}`, {
                             method: 'post',
                             body: JSON.stringify({enabled: callsExplicitlyDisabled(store.getState(), currChannelId)}),
                         });
@@ -586,7 +575,7 @@ export default class Plugin {
         const fetchChannels = async (): Promise<AnyAction[]> => {
             const actions = [];
             try {
-                const data = await Client4.doFetch<CallChannelState[]>(`${getPluginPath()}/channels`, {method: 'get'});
+                const data = await RestClient.fetch<CallChannelState[]>(`${getPluginPath()}/channels`, {method: 'get'});
 
                 for (let i = 0; i < data.length; i++) {
                     actions.push({
@@ -604,18 +593,10 @@ export default class Plugin {
                     }
 
                     actions.push({
-                        type: USERS_CONNECTED,
-                        data: {
-                            users: call.users,
-                            channelID: data[i].channel_id,
-                        },
-                    });
-
-                    actions.push({
-                        type: PROFILES_CONNECTED,
+                        type: PROFILES_JOINED,
                         data: {
                             // eslint-disable-next-line no-await-in-loop
-                            profiles: await getProfilesByIds(store.getState(), call.users),
+                            profiles: await getProfilesForSessions(store.getState(), call.sessions),
                             channelID: data[i].channel_id,
                         },
                     });
@@ -694,7 +675,7 @@ export default class Plugin {
             await registerHeaderMenuComponentIfNeeded(channelID);
 
             try {
-                const data = await Client4.doFetch<CallChannelState>(`${getPluginPath()}/${channelID}`, {method: 'get'});
+                const data = await RestClient.fetch<CallChannelState>(`${getPluginPath()}/${channelID}`, {method: 'get'});
                 store.dispatch({
                     type: RECEIVED_CHANNEL_STATE,
                     data: {id: channelID, enabled: data.enabled},
@@ -739,14 +720,6 @@ export default class Plugin {
             } else {
                 const expandedID = getExpandedChannelID();
                 if (expandedID.length > 0) {
-                    actions.push({
-                        type: USER_CONNECTED,
-                        data: {
-                            channelID: expandedID,
-                            userID: getCurrentUserId(store.getState()),
-                            currentUserID: getCurrentUserId(store.getState()),
-                        },
-                    });
                     await fetchChannelData(expandedID);
                 }
             }

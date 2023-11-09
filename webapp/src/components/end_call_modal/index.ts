@@ -1,19 +1,17 @@
-import {GlobalState} from '@mattermost/types/store';
-import {getChannel} from 'mattermost-redux/selectors/entities/channels';
-import {getCurrentUserId, getUser} from 'mattermost-redux/selectors/entities/users';
 import {connect} from 'react-redux';
 import {bindActionCreators, Dispatch} from 'redux';
 
 import {hideEndCallModal} from '../../actions';
-import {usersInCallInChannel, endCallModal} from '../../selectors';
+import {profilesInCallInChannel, endCallModal} from '../../selectors';
 import {isDMChannel, getUserIdFromDM} from '../../utils';
+import {GlobalState} from '@mattermost/types/store';
+import {getChannel} from 'mattermost-redux/selectors/entities/channels';
+import {getCurrentUserId, getUser} from 'mattermost-redux/selectors/entities/users';
 
 import EndCallModal from './component';
 
 const mapStateToProps = (state: GlobalState) => {
     const endCallState = endCallModal(state);
-    const connectedUsers = usersInCallInChannel(state, endCallState.targetID);
-
     const channel = getChannel(state, endCallState.targetID);
 
     let connectedDMUser;
@@ -24,7 +22,7 @@ const mapStateToProps = (state: GlobalState) => {
 
     return {
         show: endCallModal(state).show,
-        connectedUsers,
+        numParticipants: profilesInCallInChannel(state, endCallState.targetID).length,
         connectedDMUser,
         channel,
     };

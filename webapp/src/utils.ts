@@ -1,21 +1,22 @@
 import {makeCallsBaseAndBadgeRGB, rgbToCSS} from '@calls/common';
-import {UserState} from '@calls/common/lib/types';
+import {UserSessionState, SessionState} from '@calls/common/lib/types';
+import {DateTime, Duration, DurationLikeObject} from 'luxon';
+import {IntlShape} from 'react-intl';
+import {parseSemVer} from 'semver-parser';
+
 import {Channel} from '@mattermost/types/channels';
 import {ClientConfig} from '@mattermost/types/config';
 import {GlobalState} from '@mattermost/types/store';
 import {Team} from '@mattermost/types/teams';
 import {UserProfile} from '@mattermost/types/users';
-import {DateTime, Duration, DurationLikeObject} from 'luxon';
+import {IDMappedObjects} from '@mattermost/types/utilities';
 import {setThreadFollow} from 'mattermost-redux/actions/threads';
-import {Client4} from 'mattermost-redux/client';
 import {General} from 'mattermost-redux/constants';
 import {getRedirectChannelNameForTeam} from 'mattermost-redux/selectors/entities/channels';
 import {getCurrentRelativeTeamUrl, getCurrentTeamId, getTeam} from 'mattermost-redux/selectors/entities/teams';
 import {getCurrentUserId} from 'mattermost-redux/selectors/entities/users';
-import {IntlShape} from 'react-intl';
-import {parseSemVer} from 'semver-parser';
-
 import CallsClient from 'src/client';
+import RestClient from 'src/rest_client';
 import {notificationSounds} from 'src/webapp_globals';
 
 import {logDebug, logErr, logWarn} from './log';
@@ -39,7 +40,7 @@ export function getWSConnectionURL(config: Partial<ClientConfig>): string {
     const uri = loc.protocol === 'https:' ? 'wss:' : 'ws:';
     const baseURL = config && config.WebsocketURL ? config.WebsocketURL : `${uri}//${loc.host}${window.basename || ''}`;
 
-    return `${baseURL}${Client4.getUrlVersion()}/websocket`;
+    return `${baseURL}${RestClient.getUrlVersion()}/websocket`;
 }
 
 export function getTeamRelativeURL(team: Team) {
@@ -139,38 +140,22 @@ export function getExpandedChannelID() {
     return window.location.pathname.substr(idx + pattern.length);
 }
 
-export function alphaSortProfiles(elA: UserProfile, elB: UserProfile) {
-    const nameA = getUserDisplayName(elA);
-    const nameB = getUserDisplayName(elB);
-    return nameA.localeCompare(nameB);
+export function alphaSortSessions(profiles: IDMappedObjects<UserProfile>) {
+    return (elA: UserSessionState, elB: UserSessionState) => {
+        const profileA = profiles[elA.user_id];
+        const profileB = profiles[elB.user_id];
+        const nameA = getUserDisplayName(profileA);
+        const nameB = getUserDisplayName(profileB);
+        return nameA.localeCompare(nameB);
+    };
 }
 
-export function stateSortProfiles(profiles: UserProfile[], statuses: { [key: string]: UserState }, presenterID: string, considerReaction = false) {
-    return (elA: UserProfile, elB: UserProfile) => {
-        let stateA = statuses[elA.id];
-        let stateB = statuses[elB.id];
-
-        if (elA.id === presenterID) {
+export function stateSortSessions(presenterID: string, considerReaction = false) {
+    return (stateA: UserSessionState, stateB: UserSessionState) => {
+        if (stateA.session_id === presenterID) {
             return -1;
-        } else if (elB.id === presenterID) {
+        } else if (stateB.session_id === presenterID) {
             return 1;
-        }
-
-        if (!stateA) {
-            stateA = {
-                id: elA.id,
-                voice: false,
-                unmuted: false,
-                raised_hand: 0,
-            };
-        }
-        if (!stateB) {
-            stateB = {
-                id: elB.id,
-                voice: false,
-                unmuted: false,
-                raised_hand: 0,
-            };
         }
 
         if (stateA.raised_hand && !stateB.raised_hand) {
@@ -226,7 +211,6 @@ export async function getScreenStream(sourceID?: string, withAudio?: boolean): P
     } else {
         // browser
         try {
-            // @ts-ignore (fixed in typescript 4.4+ but webapp is on 4.3.4)
             screenStream = await navigator.mediaDevices.getDisplayMedia({
                 video: true,
                 audio: Boolean(withAudio),
@@ -271,9 +255,26 @@ export async function getProfilesByIds(state: GlobalState, ids: string[]): Promi
         }
     }
     if (missingIds.length > 0) {
-        profiles.push(...(await Client4.getProfilesByIds(missingIds)));
+        profiles.push(...(await RestClient.getProfilesByIds(missingIds)));
     }
     return profiles;
+}
+
+export async function getProfilesForSessions(state: GlobalState, sessions: SessionState[]): Promise<{[sessionID: string]: UserProfile}> {
+    const ids = sessions.map((session) => session.user_id);
+    const profiles = await getProfilesByIds(state, ids);
+
+    // Returned profiles can be deduplicated so we need a map in order to
+    // produce the expected output where each session ID points to a profile.
+    const profilesMap = profiles.reduce((obj, profile) => {
+        obj[profile.id] = profile;
+        return obj;
+    }, {} as {[userID: string]: UserProfile});
+
+    return sessions.reduce((obj, session) => {
+        obj[session.session_id] = profilesMap[session.user_id];
+        return obj;
+    }, {} as {[sessionID: string]: UserProfile});
 }
 
 export function getUserIdFromDM(dmName: string, currentUserId: string) {
